@@ -1,0 +1,886 @@
+===== common/ldpc_final_common.hpp =====
+--- /mnt/data/LDPC_AdaptiveStructV2_Original_Extract/LDPC_AdaptiveStructV2_Final/common/ldpc_final_common.hpp	2026-04-30 07:55:46.526320123 +0000
++++ /mnt/data/LDPC_AdaptiveStructV2_Fixed_Source/common/ldpc_final_common.hpp	2026-04-30 07:49:10.458206615 +0000
+@@ -13,6 +13,8 @@
+ #include <numeric>
+ #include <random>
+ #include <sstream>
++#include <set>
++#include <limits>
+ #include <stdexcept>
+ #include <string>
+ #include <vector>
+@@ -34,13 +36,31 @@
+ };
+ 
+ struct StructDiag {
+-    double weak_concentration = 0.0;   // rho_h
+-    double block_imbalance = 0.0;      // rho_b
+-    double coupling_risk = 0.0;        // rho_c
++    double weak_concentration = 0.0;   // rho_h: weakness mass in the top 10% information variables
++    double block_imbalance = 0.0;      // rho_b: coefficient of variation across QC blocks
++    double coupling_risk = 0.0;        // rho_c: hot variables coupled inside original checks
+     double target_rate = 0.0;
+     int extra_budget = 0;
+     string rate_zone = "";
+     string selected_mode = "";
++
++    // Static construction diagnostics used by AdaptiveStructV2. These are not short simulations;
++    // they are computed from candidate parity-extension graphs before transmission.
++    double hot_coverage_ratio = 0.0;
++    double hot_top10_edge_share = 0.0;
++    double hot_duplicate_pattern_ratio = 0.0;
++    int hot_max_use_count = 0;
++    int hot_pair_reuse_max = 0;
++    double hot_quality_score = 0.0;
++
++    double ext_coverage_ratio = 0.0;
++    double ext_top10_edge_share = 0.0;
++    double ext_duplicate_pattern_ratio = 0.0;
++    int ext_max_use_count = 0;
++    int ext_pair_reuse_max = 0;
++    double ext_quality_score = 0.0;
++
++    string adaptive_reason = "";
+ };
+ 
+ struct ResultRow {
+@@ -56,16 +76,36 @@
+     double EbN0_dB = 0.0;
+     double BER = 0.0;
+     double BER_info = 0.0;
+-    double FER = 0.0;
++    double FER = 0.0;       // Backward-compatible alias of FER_info.
++    double FER_info = 0.0;  // Information-frame error rate.
++    double FER_code = 0.0;  // Full decoded-codeword frame error rate.
+     double AvgIter = 0.0;
+     long long bit_errors = 0;
+     long long info_bit_errors = 0;
+-    long long frame_errors = 0;
++    long long frame_errors = 0;       // Backward-compatible: information-frame errors.
++    long long code_frame_errors = 0;
+     double upper95_if_zero_info = 0.0;
+     double weak_concentration = 0.0;
+     double block_imbalance = 0.0;
+     double coupling_risk = 0.0;
+     string rate_zone;
++
++    double hot_coverage_ratio = 0.0;
++    double hot_top10_edge_share = 0.0;
++    double hot_duplicate_pattern_ratio = 0.0;
++    int hot_max_use_count = 0;
++    int hot_pair_reuse_max = 0;
++    double hot_quality_score = 0.0;
++    double ext_coverage_ratio = 0.0;
++    double ext_top10_edge_share = 0.0;
++    double ext_duplicate_pattern_ratio = 0.0;
++    int ext_max_use_count = 0;
++    int ext_pair_reuse_max = 0;
++    double ext_quality_score = 0.0;
++    string adaptive_reason = "";
++
++    int selection_short_frames = 0;
++    int selection_extra_decodes = 0;
+ };
+ 
+ static uint64_t make_seed(uint64_t base_seed, const string& tag, int serial) {
+@@ -159,18 +199,66 @@
+ }
+ 
+ // Higher score = more vulnerable / more important.
++// The original score mostly duplicated the degree term and used fixed block/phase biases.
++// This deterministic score is tied to LDPC graph features: low variable degree, heavy
++// adjacent checks, local 4-cycle pressure and block-level weakness.
+ static vector<double> weakness_score(const LDPCCode& code) {
+     vector<int> deg = variable_degrees(code);
+     vector<vector<int>> vc = variable_to_checks(code);
++    vector<int> row_deg(code.m, 0);
++    for (int i = 0; i < code.m; ++i) row_deg[i] = (int)code.checks[i].size();
++
++    vector<double> raw_low(code.n, 0.0), raw_check(code.n, 0.0), raw_cycle(code.n, 0.0);
++    for (int v = 0; v < code.n; ++v) {
++        raw_low[v] = 1.0 / (0.5 + deg[v]);
++        double adj = 0.0;
++        for (int c : vc[v]) adj += row_deg[c];
++        raw_check[v] = adj / std::max(1, (int)vc[v].size());
++
++        // 4-cycle proxy: two checks adjacent to v sharing another variable create
++        // local short-cycle stress for iterative min-sum decoding.
++        double cyc = 0.0;
++        for (int a = 0; a < (int)vc[v].size(); ++a) {
++            const auto& ra = code.checks[vc[v][a]];
++            for (int b = a + 1; b < (int)vc[v].size(); ++b) {
++                const auto& rb = code.checks[vc[v][b]];
++                int common = 0;
++                for (int x : ra) {
++                    if (x == v) continue;
++                    if (std::find(rb.begin(), rb.end(), x) != rb.end()) common++;
++                }
++                cyc += common;
++            }
++        }
++        raw_cycle[v] = cyc;
++    }
++
++    int info_k = std::max(1, code.k);
++    int blocks = std::max(1, info_k / std::max(1, code.Z));
++    vector<double> block_low(blocks, 0.0);
++    for (int v = 0; v < info_k; ++v) block_low[v / code.Z] += raw_low[v];
++    double block_mean = std::accumulate(block_low.begin(), block_low.end(), 0.0) / blocks;
++
++    auto norm01 = [&](const vector<double>& x, int upto, int v) -> double {
++        double mn = x[0], mx = x[0];
++        for (int i = 1; i < upto; ++i) {
++            mn = std::min(mn, x[i]);
++            mx = std::max(mx, x[i]);
++        }
++        return (x[v] - mn) / (mx - mn + 1e-12);
++    };
+ 
+     vector<double> score(code.n, 0.0);
+     for (int v = 0; v < code.n; ++v) {
+-        int block = v / code.Z;
+-        double low_degree_term = 1.0 / (0.5 + deg[v]);
+-        double check_spread_term = 1.0 / (1.0 + (int)vc[v].size());
+-        double block_bias = 0.04 * ((block % 5) == 0) + 0.025 * ((block % 7) == 0);
+-        double phase_bias = 0.012 * ((v % code.Z) < code.Z / 4);
+-        score[v] = 0.75 * low_degree_term + 0.20 * check_spread_term + block_bias + phase_bias;
++        int iv = std::min(v, info_k - 1);
++        int b = std::min(blocks - 1, std::max(0, iv / std::max(1, code.Z)));
++        double low_term = norm01(raw_low, info_k, iv);
++        double check_term = norm01(raw_check, info_k, iv);
++        double cycle_term = norm01(raw_cycle, info_k, iv);
++        double block_term = std::max(0.0, (block_low[b] - block_mean) / (block_mean + 1e-12));
++        double deterministic_tie = 1e-5 * ((v * 1103515245u + 12345u) & 1023u);
++        score[v] = 0.48 * low_term + 0.18 * check_term + 0.24 * cycle_term
++                 + 0.10 * std::min(2.0, block_term) + deterministic_tie;
+     }
+     return score;
+ }
+@@ -226,165 +314,313 @@
+     return d;
+ }
+ 
+-// Formal AdaptiveStructV2 gate from the thesis plan:
+-// Construct HotspotOnlyParity and ExtParityV2 candidates, then statically select by structure diagnostics + rate gate.
+-// No short simulation is used here.
+-static string choose_adaptive_struct_v2(const LDPCCode& base, double target_rate, StructDiag* out = nullptr) {
+-    StructDiag d = diagnose_structure(base, target_rate);
+-
+-    // Hot is preferred only when redundancy is sufficiently large, weak nodes are concentrated,
+-    // and local coupling risk is not excessive. Otherwise coverage-balanced ExtParityV2 is safer.
+-    double hot_score = 0.0;
+-    if (target_rate <= 0.36) hot_score += 1.20;
+-    else if (target_rate <= 0.405) hot_score += 0.15;
+-    else hot_score -= 0.50;
+-
+-    hot_score += 2.50 * (d.weak_concentration - 0.105);
+-    hot_score += 0.80 * (d.block_imbalance - 0.080);
+-    hot_score -= 1.20 * std::max(0.0, d.coupling_risk - 0.18);
+-
+-    if (hot_score >= 0.95) d.selected_mode = "HotspotOnlyParity";
+-    else d.selected_mode = "ExtParityV2";
++// ------------------------- Redundancy construction -------------------------
+ 
+-    if (out) *out = d;
+-    return d.selected_mode;
+-}
++struct ConstructionDiagnostics {
++    string mode = "";
++    int extra = 0;
++    int degree = 0;
++    int total_edges = 0;
++    int covered_vars = 0;
++    int uncovered_vars = 0;
++    int max_use_count = 0;
++    int max_block_use = 0;
++    int pair_reuse_max = 0;
++    int duplicate_patterns = 0;
++    double coverage_ratio = 0.0;
++    double top10_edge_share = 0.0;
++    double duplicate_pattern_ratio = 0.0;
++    double block_imbalance_after = 0.0;
++    double weak_edge_gain = 0.0;
++    double quality_score = 0.0;
++    double risk_score = 0.0;
++};
+ 
+-// ------------------------- Redundancy construction -------------------------
++struct ConstructionState {
++    const LDPCCode& base;
++    string mode;
++    int extra = 0;
++    int degree = 5;
++    int total_edges = 0;
++    int blocks = 1;
++    int min_coverage_target = 0;
++    int max_use_allowed = 1;
++    int max_block_allowed = 1;
++    int max_pair_reuse_allowed = 1;
++    vector<double> w;
++    vector<int> ord;
++    vector<int> use_count;
++    vector<int> block_use;
++    std::map<std::pair<int,int>, int> pair_use;
++    std::map<string, int> pattern_use;
++    int covered_count = 0;
++    int total_selected_edges = 0;
++    double selected_weak_sum = 0.0;
++
++    ConstructionState(const LDPCCode& b, const string& m, int ex, int deg)
++        : base(b), mode(m), extra(ex), degree(deg) {
++        total_edges = std::max(0, extra * degree);
++        blocks = std::max(1, base.k / std::max(1, base.Z));
++        w = weakness_score(base);
++        ord = order_desc(w, base.k);
++        use_count.assign(base.k, 0);
++        block_use.assign(blocks, 0);
++
++        double avg_use = (double)std::max(1, total_edges) / std::max(1, base.k);
++        double avg_block = (double)std::max(1, total_edges) / std::max(1, blocks);
++        if (mode == "HotspotOnlyParity") {
++            // Hotspot remains weak-node first, but with hard constraints to avoid the
++            // coverage collapse and duplicate information-subsets found in the original code.
++            min_coverage_target = std::min(base.k, std::max(1, (int)std::llround(0.72 * base.k)));
++            max_use_allowed = std::max(2, (int)std::ceil(avg_use) + 2);
++            max_pair_reuse_allowed = 2;
++        } else {
++            // ExtParityV2 is the weak-coverage balanced construction.
++            min_coverage_target = std::min(base.k, std::max(1, (int)std::llround(0.98 * base.k)));
++            max_use_allowed = std::max(2, (int)std::ceil(avg_use) + 1);
++            max_pair_reuse_allowed = 1;
++        }
++        if (total_edges < min_coverage_target) min_coverage_target = total_edges;
++        max_block_allowed = std::max(degree, (int)std::ceil(avg_block) + degree);
++    }
++};
+ 
+-static vector<int> select_uniform_vars(const LDPCCode& base, int row_id, int degree) {
+-    vector<int> vars;
+-    int stride = std::max(1, base.k / degree);
+-    for (int t = 0; t < degree; ++t) {
+-        int v = (row_id * 37 + t * stride + t * 11) % base.k;
+-        while (std::find(vars.begin(), vars.end(), v) != vars.end()) v = (v + 1) % base.k;
+-        vars.push_back(v);
++static string pattern_signature(vector<int> vars) {
++    std::sort(vars.begin(), vars.end());
++    std::ostringstream ss;
++    for (int i = 0; i < (int)vars.size(); ++i) {
++        if (i) ss << '-';
++        ss << vars[i];
++    }
++    return ss.str();
++}
++
++static int pair_count_for(const ConstructionState& st, int a, int b) {
++    if (a > b) std::swap(a, b);
++    auto it = st.pair_use.find({a, b});
++    return (it == st.pair_use.end()) ? 0 : it->second;
++}
++
++static int pair_penalty_sum(const ConstructionState& st, int v, const vector<int>& vars, int* max_pair = nullptr) {
++    int s = 0, mx = 0;
++    for (int u : vars) {
++        int c = pair_count_for(st, u, v);
++        s += c;
++        mx = std::max(mx, c);
++    }
++    if (max_pair) *max_pair = mx;
++    return s;
++}
++
++static double selection_score(const LDPCCode& base, const ConstructionState& st, int row_id,
++                              int t, int v, const vector<int>& vars,
++                              const vector<int>& local_block_used, bool hotspot, int relax_pass) {
++    int b = std::min(st.blocks - 1, std::max(0, v / std::max(1, base.Z)));
++    int pair_max = 0;
++    int pair_sum = pair_penalty_sum(st, v, vars, &pair_max);
++
++    double avg_use_now = std::max(1.0, (double)std::max(1, st.total_selected_edges) / std::max(1, base.k));
++    double avg_block_now = std::max(1.0, (double)std::max(1, st.total_selected_edges) / std::max(1, st.blocks));
++    double uncovered_bonus = (st.use_count[v] == 0) ? ((st.covered_count < st.min_coverage_target) ? 2.40 : 0.42) : 0.0;
++    double weak_weight = hotspot ? 2.65 : 1.45;
++    double use_weight = hotspot ? 0.78 : 1.10;
++    double block_weight = hotspot ? 0.34 : 0.48;
++    double pair_weight = hotspot ? 1.00 : 1.55;
++
++    double s = weak_weight * st.w[v]
++             + uncovered_bonus
++             - use_weight * ((double)st.use_count[v] / avg_use_now)
++             - block_weight * ((double)st.block_use[b] / avg_block_now)
++             - pair_weight * pair_sum
++             - 0.40 * pair_max
++             - 0.38 * local_block_used[b]
++             + 1e-6 * ((row_id + 1) * 131 + (t + 7) * 17 + v % 97);
++
++    if (relax_pass == 0) {
++        if (st.use_count[v] >= st.max_use_allowed) s -= 1e6;
++        if (st.block_use[b] >= st.max_block_allowed) s -= 1e5;
++        if (pair_max >= st.max_pair_reuse_allowed) s -= 1e5;
++    } else if (relax_pass == 1) {
++        if (st.use_count[v] >= st.max_use_allowed + 1) s -= 1e6;
++        if (pair_max >= st.max_pair_reuse_allowed + 1) s -= 1e5;
+     }
+-    return vars;
++    return s;
+ }
+ 
+-// Fixed HotspotOnlyParity: hot priority but not pathological over-concentration.
+-static vector<int> select_hotspot_vars(
+-    const LDPCCode& base,
+-    int row_id,
+-    int degree,
+-    vector<int>& use_count,
+-    vector<int>& block_use
+-) {
+-    vector<double> w = weakness_score(base);
+-    vector<int> ord = order_desc(w, base.k);
+-
+-    int blocks = std::max(1, base.k / base.Z);
+-    int pool = std::min(base.k, std::max(base.k / 3, degree * 16)); // larger than old k/6 pool
++static vector<int> select_scored_vars(const LDPCCode& base, int row_id, int degree,
++                                      ConstructionState& st, bool hotspot) {
+     vector<int> vars;
+-    vector<int> local_block_used(blocks, 0);
++    vector<int> local_block_used(st.blocks, 0);
++    int pool = base.k;
++    if (hotspot) {
++        int min_pool = std::max(st.min_coverage_target + degree * 8, (int)std::llround(0.76 * base.k));
++        pool = std::min(base.k, std::max(degree * 32, min_pool));
++    }
+ 
+     for (int t = 0; t < degree; ++t) {
+         int best = -1;
+-        double best_score = -1e100;
+-
+-        for (int rank = 0; rank < pool; ++rank) {
+-            int v = ord[(rank + row_id * 7 + t * 13) % pool];
+-            if (std::find(vars.begin(), vars.end(), v) != vars.end()) continue;
+-            int b = v / base.Z;
+-            double s = 1.70 * w[v]
+-                     - 0.18 * use_count[v]
+-                     - 0.09 * block_use[b]
+-                     - 0.22 * local_block_used[b];
+-            if (s > best_score) {
+-                best_score = s;
+-                best = v;
++        double best_score = -std::numeric_limits<double>::infinity();
++        for (int pass = 0; pass < 3 && best < 0; ++pass) {
++            best_score = -std::numeric_limits<double>::infinity();
++            for (int rank = 0; rank < pool; ++rank) {
++                int idx = (rank + row_id * 17 + t * 29) % pool;
++                int v = st.ord[idx];
++                if (std::find(vars.begin(), vars.end(), v) != vars.end()) continue;
++                double s = selection_score(base, st, row_id, t, v, vars, local_block_used, hotspot, pass);
++                if (s > best_score) {
++                    best_score = s;
++                    best = v;
++                }
++            }
++            if (best_score < -1e4) best = -1; // all candidates violated hard constraints; relax.
++        }
++        if (best < 0) {
++            for (int v = 0; v < base.k; ++v) {
++                if (std::find(vars.begin(), vars.end(), v) == vars.end()) { best = v; break; }
+             }
+         }
+-
+-        if (best < 0) best = ord[(row_id + t) % pool];
+         vars.push_back(best);
+         local_block_used[best / base.Z]++;
+     }
+ 
+-    for (int v : vars) {
+-        use_count[v]++;
+-        block_use[v / base.Z]++;
++    // Avoid exactly duplicated information-subsets; this reduces redundant parity checks and short cycles.
++    if (st.pattern_use.count(pattern_signature(vars))) {
++        for (int pos = degree - 1; pos >= 0 && st.pattern_use.count(pattern_signature(vars)); --pos) {
++            int old = vars[pos];
++            int best = -1;
++            double best_score = -std::numeric_limits<double>::infinity();
++            vector<int> tmp = vars;
++            for (int v = 0; v < base.k; ++v) {
++                if (std::find(vars.begin(), vars.end(), v) != vars.end() && v != old) continue;
++                tmp[pos] = v;
++                if (st.pattern_use.count(pattern_signature(tmp))) continue;
++                int b = v / base.Z;
++                if (st.use_count[v] > st.max_use_allowed + 1) continue;
++                if (st.block_use[b] > st.max_block_allowed + degree) continue;
++                double s = selection_score(base, st, row_id, pos, v, tmp, local_block_used, hotspot, 2);
++                if (s > best_score) { best_score = s; best = v; }
++            }
++            if (best >= 0) vars[pos] = best;
++        }
+     }
+     return vars;
+ }
+ 
+-static vector<int> select_ext_v2_vars(
+-    const LDPCCode& base,
+-    int row_id,
+-    int degree,
+-    vector<int>& use_count,
+-    vector<int>& block_use
+-) {
+-    vector<double> w = weakness_score(base);
+-    int blocks = std::max(1, base.k / base.Z);
+-    vector<int> vars;
+-    vector<int> local_block_used(blocks, 0);
+-
+-    double mean_block_use = 0.0;
+-    for (int x : block_use) mean_block_use += x;
+-    mean_block_use /= std::max(1, blocks);
+-
+-    for (int t = 0; t < degree; ++t) {
+-        int best = -1;
+-        double best_score = -1e100;
+-
+-        for (int v = 0; v < base.k; ++v) {
+-            if (std::find(vars.begin(), vars.end(), v) != vars.end()) continue;
+-            int b = v / base.Z;
+-            double coverage_bonus = (block_use[b] <= mean_block_use) ? 0.08 : 0.0;
+-            double s = 1.15 * w[v]
+-                     + coverage_bonus
+-                     - 0.26 * use_count[v]
+-                     - 0.13 * block_use[b]
+-                     - 0.20 * local_block_used[b]
+-                     + 0.004 * ((row_id + t + b) % 11);
+-            if (s > best_score) {
+-                best_score = s;
+-                best = v;
+-            }
++static void commit_selected_vars(const LDPCCode& base, ConstructionState& st, const vector<int>& vars) {
++    for (int v : vars) {
++        if (st.use_count[v] == 0) st.covered_count++;
++        st.use_count[v]++;
++        st.block_use[v / base.Z]++;
++        st.total_selected_edges++;
++        st.selected_weak_sum += st.w[v];
++    }
++    for (int i = 0; i < (int)vars.size(); ++i) {
++        for (int j = i + 1; j < (int)vars.size(); ++j) {
++            int a = vars[i], b = vars[j];
++            if (a > b) std::swap(a, b);
++            st.pair_use[{a, b}]++;
+         }
+-
+-        if (best < 0) best = (row_id * 17 + t * 31) % base.k;
+-        vars.push_back(best);
+-        local_block_used[best / base.Z]++;
+     }
++    st.pattern_use[pattern_signature(vars)]++;
++}
+ 
+-    for (int v : vars) {
+-        use_count[v]++;
+-        block_use[v / base.Z]++;
++static vector<int> select_uniform_vars(const LDPCCode& base, int row_id, int degree) {
++    vector<int> vars;
++    int stride = std::max(1, base.k / degree);
++    for (int t = 0; t < degree; ++t) {
++        int v = (row_id * 37 + t * stride + t * 11) % base.k;
++        while (std::find(vars.begin(), vars.end(), v) != vars.end()) v = (v + 1) % base.k;
++        vars.push_back(v);
+     }
+     return vars;
+ }
+ 
+-static LDPCCode make_extended_code(const LDPCCode& base, double target_rate, const string& mode, int degree = 5) {
++static ConstructionDiagnostics summarize_construction(const LDPCCode& base, const ConstructionState& st) {
++    ConstructionDiagnostics d;
++    d.mode = st.mode;
++    d.extra = st.extra;
++    d.degree = st.degree;
++    d.total_edges = st.total_edges;
++    d.covered_vars = st.covered_count;
++    d.uncovered_vars = std::max(0, base.k - st.covered_count);
++    d.coverage_ratio = (double)d.covered_vars / std::max(1, base.k);
++    d.max_use_count = st.use_count.empty() ? 0 : *std::max_element(st.use_count.begin(), st.use_count.end());
++    d.max_block_use = st.block_use.empty() ? 0 : *std::max_element(st.block_use.begin(), st.block_use.end());
++    for (const auto& kv : st.pair_use) d.pair_reuse_max = std::max(d.pair_reuse_max, kv.second);
++    for (const auto& kv : st.pattern_use) if (kv.second > 1) d.duplicate_patterns += kv.second - 1;
++    d.duplicate_pattern_ratio = (double)d.duplicate_patterns / std::max(1, st.extra);
++
++    vector<int> uses = st.use_count;
++    std::sort(uses.begin(), uses.end(), std::greater<int>());
++    int topN = std::max(1, base.k / 10);
++    long long top_edges = 0;
++    for (int i = 0; i < std::min(topN, (int)uses.size()); ++i) top_edges += uses[i];
++    d.top10_edge_share = (double)top_edges / std::max(1, st.total_edges);
++
++    double mean_block = 0.0;
++    for (int x : st.block_use) mean_block += x;
++    mean_block /= std::max(1, (int)st.block_use.size());
++    double var = 0.0;
++    for (int x : st.block_use) var += (x - mean_block) * (x - mean_block);
++    d.block_imbalance_after = std::sqrt(var / std::max(1, (int)st.block_use.size())) / (mean_block + 1e-12);
++
++    double mean_w = 0.0;
++    for (int v = 0; v < base.k; ++v) mean_w += st.w[v];
++    mean_w /= std::max(1, base.k);
++    d.weak_edge_gain = (st.selected_weak_sum / std::max(1, st.total_selected_edges)) / (mean_w + 1e-12);
++
++    double coverage_part = d.coverage_ratio;
++    double weakness_part = std::min(1.0, d.weak_edge_gain / 1.65);
++    double spread_part = 1.0 - std::min(1.0, d.top10_edge_share / 0.35);
++    double block_part = 1.0 - std::min(1.0, d.block_imbalance_after / 0.65);
++    double dup_part = 1.0 - std::min(1.0, d.duplicate_pattern_ratio / 0.08);
++    d.quality_score = 0.38 * coverage_part + 0.28 * weakness_part + 0.18 * spread_part
++                    + 0.10 * block_part + 0.06 * dup_part;
++    d.risk_score = 1.45 * (1.0 - d.coverage_ratio)
++                 + 2.00 * d.duplicate_pattern_ratio
++                 + 1.40 * std::max(0.0, d.top10_edge_share - 0.24)
++                 + 0.08 * std::max(0, d.pair_reuse_max - 2)
++                 + 0.30 * d.block_imbalance_after;
++    return d;
++}
++
++static LDPCCode make_extended_code(const LDPCCode& base, double target_rate, const string& mode,
++                                   int degree = 5, ConstructionDiagnostics* cd = nullptr) {
+     int tx = target_tx_len(base.k, base.n, target_rate);
+     int extra = std::max(0, tx - base.n);
+-    if (extra == 0) return base;
++    if (extra == 0) {
++        if (cd) {
++            ConstructionDiagnostics z;
++            z.mode = mode;
++            z.covered_vars = base.k;
++            z.coverage_ratio = 1.0;
++            z.quality_score = 1.0;
++            *cd = z;
++        }
++        return base;
++    }
++
++    string actual = mode;
++    if (actual != "UniformParity" && actual != "HotspotOnlyParity" && actual != "ExtParityV2") actual = "ExtParityV2";
++    ConstructionState st(base, actual, extra, degree);
+ 
+     LDPCCode c = base;
+-    c.name = base.name + "_" + mode;
++    c.name = base.name + "_" + actual;
+     c.n = base.n + extra;
+     c.m = base.m + extra;
+     c.k = base.k;
+     c.checks.reserve(base.checks.size() + extra);
+ 
+-    int blocks = std::max(1, base.k / base.Z);
+-    vector<int> use_count(base.k, 0);
+-    vector<int> block_use(blocks, 0);
+-
+     for (int j = 0; j < extra; ++j) {
+         vector<int> vars;
+-        if (mode == "UniformParity") {
++        if (actual == "UniformParity") {
+             vars = select_uniform_vars(base, j, degree);
+-        } else if (mode == "HotspotOnlyParity") {
+-            vars = select_hotspot_vars(base, j, degree, use_count, block_use);
+-        } else if (mode == "ExtParityV2") {
+-            vars = select_ext_v2_vars(base, j, degree, use_count, block_use);
++        } else if (actual == "HotspotOnlyParity") {
++            vars = select_scored_vars(base, j, degree, st, true);
+         } else {
+-            // Defensive fallback: coverage-balanced construction.
+-            vars = select_ext_v2_vars(base, j, degree, use_count, block_use);
++            vars = select_scored_vars(base, j, degree, st, false);
+         }
++        commit_selected_vars(base, st, vars);
+ 
+         int new_var = base.n + j;
+         vector<int> row;
+@@ -393,9 +629,65 @@
+         row.push_back(new_var);
+         c.checks.push_back(row);
+     }
++    if (cd) *cd = summarize_construction(base, st);
+     return c;
+ }
+ 
++// Formal AdaptiveStructV2 gate from the thesis plan: static structural diagnostics plus rate gate.
++// It compares HotspotOnlyParity and ExtParityV2 candidate graphs without using short BER simulation.
++static string choose_adaptive_struct_v2(const LDPCCode& base, double target_rate, StructDiag* out = nullptr) {
++    StructDiag d = diagnose_structure(base, target_rate);
++    ConstructionDiagnostics hot, ext;
++    (void)make_extended_code(base, target_rate, "HotspotOnlyParity", 5, &hot);
++    (void)make_extended_code(base, target_rate, "ExtParityV2", 5, &ext);
++
++    d.hot_coverage_ratio = hot.coverage_ratio;
++    d.hot_top10_edge_share = hot.top10_edge_share;
++    d.hot_duplicate_pattern_ratio = hot.duplicate_pattern_ratio;
++    d.hot_max_use_count = hot.max_use_count;
++    d.hot_pair_reuse_max = hot.pair_reuse_max;
++    d.hot_quality_score = hot.quality_score;
++    d.ext_coverage_ratio = ext.coverage_ratio;
++    d.ext_top10_edge_share = ext.top10_edge_share;
++    d.ext_duplicate_pattern_ratio = ext.duplicate_pattern_ratio;
++    d.ext_max_use_count = ext.max_use_count;
++    d.ext_pair_reuse_max = ext.pair_reuse_max;
++    d.ext_quality_score = ext.quality_score;
++
++    double avg_use = (double)std::max(1, d.extra_budget * 5) / std::max(1, base.k);
++    bool low_rate = target_rate <= 0.36;
++    bool hot_safe = hot.coverage_ratio >= (low_rate ? 0.68 : 0.62)
++                 && hot.duplicate_pattern_ratio <= 0.03
++                 && hot.pair_reuse_max <= 2
++                 && hot.top10_edge_share <= 0.24
++                 && hot.max_use_count <= (int)std::ceil(avg_use) + 3;
++    bool structure_supports_hot = d.weak_concentration >= 0.112
++                               && d.coupling_risk <= 0.42
++                               && (d.block_imbalance >= 0.50 || d.coupling_risk >= 0.10 || hot.coverage_ratio >= 0.85);
++
++    // Coverage-heavy ExtParityV2 is the safe default. Hotspot is selected only when the base
++    // graph shows concentrated/block-local weakness and the repaired Hotspot candidate itself is safe.
++    double structural_bias = 0.55 * std::max(0.0, d.block_imbalance - 0.42)
++                           + 0.35 * std::max(0.0, d.coupling_risk - 0.08)
++                           + 0.80 * std::max(0.0, hot.coverage_ratio - 0.84)
++                           + 0.18 * std::max(0.0, d.weak_concentration - 0.14)
++                           + (low_rate ? 0.020 : 0.0);
++    double gate = (hot.quality_score - ext.quality_score) + structural_bias;
++
++    if (hot_safe && structure_supports_hot && gate > 0.0) {
++        d.selected_mode = "HotspotOnlyParity";
++        d.adaptive_reason = "hot_safe_static_gate";
++    } else {
++        d.selected_mode = "ExtParityV2";
++        if (!hot_safe) d.adaptive_reason = "hot_candidate_structural_risk";
++        else if (!structure_supports_hot) d.adaptive_reason = "weakness_not_concentrated_enough";
++        else d.adaptive_reason = "ext_quality_or_rate_gate";
++    }
++
++    if (out) *out = d;
++    return d.selected_mode;
++}
++
+ static vector<int> repeat_counts(const LDPCCode& base, double target_rate, const string& scheme) {
+     int tx = target_tx_len(base.k, base.n, target_rate);
+     int extra = std::max(0, tx - base.n);
+@@ -403,17 +695,31 @@
+     if (extra == 0) return cnt;
+ 
+     vector<double> w = weakness_score(base);
+-    vector<int> ord = order_desc(w, base.k);
++    int blocks = std::max(1, base.k / std::max(1, base.Z));
++    vector<int> block_extra(blocks, 0);
++    int max_extra_per_var = std::max(1, (int)std::ceil((double)extra / std::max(1, base.k)) + 2);
+ 
+     for (int j = 0; j < extra; ++j) {
+-        int v;
++        int v = 0;
+         if (scheme == "UniformRepeat") {
+             v = (int)((1LL * j * base.k) / std::max(1, extra)) % base.k;
+         } else {
+-            int pool = std::max(8, std::min(base.k, extra));
+-            v = ord[j % pool];
++            double best = -std::numeric_limits<double>::infinity();
++            for (int cand = 0; cand < base.k; ++cand) {
++                int used = cnt[cand] - 1;
++                int b = cand / base.Z;
++                double avg_block = std::max(1.0, (double)j / std::max(1, blocks));
++                double uncovered_bonus = (used == 0) ? 0.55 : 0.0;
++                double score = 1.85 * w[cand] + uncovered_bonus
++                             - 0.95 * used
++                             - 0.18 * ((double)block_extra[b] / avg_block)
++                             + 1e-6 * ((j + 3) * 97 + cand % 89);
++                if (used >= max_extra_per_var) score -= 1e6;
++                if (score > best) { best = score; v = cand; }
++            }
+         }
+         cnt[v]++;
++        block_extra[v / base.Z]++;
+     }
+     return cnt;
+ }
+@@ -484,7 +790,8 @@
+ struct Counters {
+     long long bit_errors = 0;
+     long long info_bit_errors = 0;
+-    long long frame_errors = 0;
++    long long frame_errors = 0;       // information-frame errors
++    long long code_frame_errors = 0;  // full decoded-codeword frame errors
+     long long total_bits = 0;
+     long long total_info_bits = 0;
+     long long total_iters = 0;
+@@ -529,6 +836,7 @@
+         out.bit_errors += berr;
+         out.info_bit_errors += ierr;
+         out.frame_errors += (ierr > 0);
++        out.code_frame_errors += (berr > 0);
+         out.total_bits += sim_code.n;
+         out.total_info_bits += info_k;
+         out.total_iters += iters;
+@@ -559,6 +867,7 @@
+         total.bit_errors += c.bit_errors;
+         total.info_bit_errors += c.info_bit_errors;
+         total.frame_errors += c.frame_errors;
++        total.code_frame_errors += c.code_frame_errors;
+         total.total_bits += c.total_bits;
+         total.total_info_bits += c.total_info_bits;
+         total.total_iters += c.total_iters;
+@@ -582,15 +891,31 @@
+     r.bit_errors = total.bit_errors;
+     r.info_bit_errors = total.info_bit_errors;
+     r.frame_errors = total.frame_errors;
++    r.code_frame_errors = total.code_frame_errors;
+     r.BER = (double)total.bit_errors / std::max(1LL, total.total_bits);
+     r.BER_info = (double)total.info_bit_errors / std::max(1LL, total.total_info_bits);
+-    r.FER = (double)total.frame_errors / std::max(1, frames);
++    r.FER_info = (double)total.frame_errors / std::max(1, frames);
++    r.FER_code = (double)total.code_frame_errors / std::max(1, frames);
++    r.FER = r.FER_info;
+     r.AvgIter = (double)total.total_iters / std::max(1, frames);
+     r.upper95_if_zero_info = (total.info_bit_errors == 0) ? 3.0 / std::max(1LL, total.total_info_bits) : 0.0;
+     r.weak_concentration = diag.weak_concentration;
+     r.block_imbalance = diag.block_imbalance;
+     r.coupling_risk = diag.coupling_risk;
+     r.rate_zone = diag.rate_zone;
++    r.hot_coverage_ratio = diag.hot_coverage_ratio;
++    r.hot_top10_edge_share = diag.hot_top10_edge_share;
++    r.hot_duplicate_pattern_ratio = diag.hot_duplicate_pattern_ratio;
++    r.hot_max_use_count = diag.hot_max_use_count;
++    r.hot_pair_reuse_max = diag.hot_pair_reuse_max;
++    r.hot_quality_score = diag.hot_quality_score;
++    r.ext_coverage_ratio = diag.ext_coverage_ratio;
++    r.ext_top10_edge_share = diag.ext_top10_edge_share;
++    r.ext_duplicate_pattern_ratio = diag.ext_duplicate_pattern_ratio;
++    r.ext_max_use_count = diag.ext_max_use_count;
++    r.ext_pair_reuse_max = diag.ext_pair_reuse_max;
++    r.ext_quality_score = diag.ext_quality_score;
++    r.adaptive_reason = diag.adaptive_reason;
+     return r;
+ }
+ 
+@@ -652,6 +977,8 @@
+                              frames, eb, max_iter, alpha, seed, serial + 303);
+     r.scheme = "AdaptiveSelectV8";
+     r.selected_mode = chosen;
++    r.selection_short_frames = short_frames;
++    r.selection_extra_decodes = 2 * short_frames;
+     return r;
+ }
+ 
+@@ -659,8 +986,11 @@
+     std::ofstream out(path);
+     if (!out) throw std::runtime_error("Cannot open output: " + path);
+     out << "experiment,matrix,scheme,selected_mode,frames,n,k,tx_len,effective_rate,EbN0_dB,"
+-        << "BER,BER_info,FER,AvgIter,bit_errors,info_bit_errors,frame_errors,upper95_if_zero_info,"
+-        << "weak_concentration,block_imbalance,coupling_risk,rate_zone\n";
++        << "BER,BER_info,FER,FER_info,FER_code,AvgIter,bit_errors,info_bit_errors,frame_errors,code_frame_errors,upper95_if_zero_info,"
++        << "weak_concentration,block_imbalance,coupling_risk,rate_zone,"
++        << "hot_coverage_ratio,hot_top10_edge_share,hot_duplicate_pattern_ratio,hot_max_use_count,hot_pair_reuse_max,hot_quality_score,"
++        << "ext_coverage_ratio,ext_top10_edge_share,ext_duplicate_pattern_ratio,ext_max_use_count,ext_pair_reuse_max,ext_quality_score,"
++        << "adaptive_reason,selection_short_frames,selection_extra_decodes\n";
+     out << std::setprecision(12);
+     for (const auto& r : rows) {
+         out << r.experiment << ','
+@@ -676,15 +1006,33 @@
+             << r.BER << ','
+             << r.BER_info << ','
+             << r.FER << ','
++            << r.FER_info << ','
++            << r.FER_code << ','
+             << r.AvgIter << ','
+             << r.bit_errors << ','
+             << r.info_bit_errors << ','
+             << r.frame_errors << ','
++            << r.code_frame_errors << ','
+             << r.upper95_if_zero_info << ','
+             << r.weak_concentration << ','
+             << r.block_imbalance << ','
+             << r.coupling_risk << ','
+-            << r.rate_zone << '\n';
++            << r.rate_zone << ','
++            << r.hot_coverage_ratio << ','
++            << r.hot_top10_edge_share << ','
++            << r.hot_duplicate_pattern_ratio << ','
++            << r.hot_max_use_count << ','
++            << r.hot_pair_reuse_max << ','
++            << r.hot_quality_score << ','
++            << r.ext_coverage_ratio << ','
++            << r.ext_top10_edge_share << ','
++            << r.ext_duplicate_pattern_ratio << ','
++            << r.ext_max_use_count << ','
++            << r.ext_pair_reuse_max << ','
++            << r.ext_quality_score << ','
++            << r.adaptive_reason << ','
++            << r.selection_short_frames << ','
++            << r.selection_extra_decodes << '\n';
+     }
+ }
+ 
+
+===== Experiment8_ThresholdScan/main.cpp =====
+--- /mnt/data/LDPC_AdaptiveStructV2_Original_Extract/LDPC_AdaptiveStructV2_Final/Experiment8_ThresholdScan/main.cpp	2026-04-30 07:55:46.602283190 +0000
++++ /mnt/data/LDPC_AdaptiveStructV2_Fixed_Source/Experiment8_ThresholdScan/main.cpp	2026-04-30 07:43:08.408207959 +0000
+@@ -9,7 +9,7 @@
+     vector<ResultRow> rows;
+     int serial = 1;
+     vector<double> eb;
+-    for (int i = 16; i <= 34; ++i) eb.push_back(i / 10.0); // 1.6 to 3.4 dB
++    for (int i = 16; i <= 48; ++i) eb.push_back(i / 10.0); // 1.6 to 4.8 dB, dense threshold scan
+ 
+     push_methods(rows, "Exp8_ThresholdScan_R04", A,
+                  {"NoRepeat","HotspotOnlyParity","AdaptiveStructV2"},
+
+===== README.md =====
+--- /mnt/data/LDPC_AdaptiveStructV2_Original_Extract/LDPC_AdaptiveStructV2_Final/README.md	2026-04-30 07:55:46.606976771 +0000
++++ /mnt/data/LDPC_AdaptiveStructV2_Fixed_Source/README.md	2026-04-30 07:55:20.608802060 +0000
+@@ -66,3 +66,17 @@
+ - block_imbalance
+ - coupling_risk
+ - rate_zone
++
++
++## 本次算法修复说明
++
++本修复版不是只改 CSV 或论文表述，而是改了公共算法 `common/ldpc_final_common.hpp`：
++
++- `HotspotOnlyParity`：保留“关键弱点优先”，但新增覆盖率、节点最大使用次数、块使用、pair 复用和重复信息子集约束，避免冗余过度集中。
++- `ExtParityV2`：实现为“弱点-覆盖-重复惩罚”平衡构造，覆盖约束更强。
++- `AdaptiveStructV2`：仍然只在 `HotspotOnlyParity` 和 `ExtParityV2` 之间静态选择；选择依据是基础矩阵结构诊断、目标码率门控和候选扩展图的结构诊断，不使用短仿真。
++- `FER`：保留旧字段，但其含义为 `FER_info`；新增 `FER_code` 用于完整 decoded codeword 帧错误率。
++- `AdaptiveSelectV8`：新增 `selection_short_frames` 和 `selection_extra_decodes`，便于实验 9 体现短仿真额外开销。
++- 实验 8 的门槛扫描范围扩展到 1.6-4.8 dB，以更符合 BER_info < 1e-3 crossing 的实验要求。
++
++建议重新跑正式 20000 帧结果，旧压缩包内的历史 CSV 不再作为修复后算法结论使用。
+
+===== compile_check_report.txt =====
+--- /mnt/data/LDPC_AdaptiveStructV2_Original_Extract/LDPC_AdaptiveStructV2_Final/compile_check_report.txt	2026-04-30 07:55:46.526913850 +0000
++++ /mnt/data/LDPC_AdaptiveStructV2_Fixed_Source/compile_check_report.txt	2026-04-30 07:55:20.609464100 +0000
+@@ -1,26 +1,12 @@
+-Experiment1_Baseline_RouteValidation: OK
++Algorithm repair compile check
+ 
++Environment: Linux g++, C++17
+ 
+-Experiment2_Hotspot_vs_UniformParity: OK
+-
+-
+-Experiment3_Hotspot_vs_ExtParityV2: OK
+-
+-
+-Experiment4_AdaptiveStructV2_Core: OK
+-
+-
+-Experiment5_MainResult_R0348: OK
+-
+-
+-Experiment6_MainResult_R04: OK
+-
+-
+-Experiment7_Generalization_MultiMatrix: OK
+-
+-
+-Experiment8_ThresholdScan: OK
+-
+-
+-Experiment9_Engineering_AdaptiveSelect_vs_Struct: OK
++Checked:
++- All 9 experiment entrypoints compile with: g++ -std=c++17 -O0 <main.cpp>
++- Representative O2 compile checks passed for all experiment entrypoints individually with: g++ -std=c++17 -O2 <main.cpp>
++- Short smoke CSVs were generated for experiments 1, 2, 3, 4, 5, 6 and 9.
++- Static construction diagnostics were generated in validation_smoke/construction_diagnostics_fixed.csv.
+ 
++Note:
++The packaged historical all_results_frames_* directories from the original zip were removed from this fixed-source deliverable to avoid mixing old results with the repaired algorithm.
+

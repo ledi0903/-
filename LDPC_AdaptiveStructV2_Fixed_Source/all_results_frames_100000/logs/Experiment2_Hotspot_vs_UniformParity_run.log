@@ -1,0 +1,17 @@
+[done] Exp2_R0348_Hotspot_vs_UniformParity | A_main_QC_12x24_Z32 | UniformParity | EbN0=1.5
+[done] Exp2_R0348_Hotspot_vs_UniformParity | A_main_QC_12x24_Z32 | UniformParity | EbN0=1.75
+[done] Exp2_R0348_Hotspot_vs_UniformParity | A_main_QC_12x24_Z32 | UniformParity | EbN0=2
+[done] Exp2_R0348_Hotspot_vs_UniformParity | A_main_QC_12x24_Z32 | UniformParity | EbN0=2.25
+[done] Exp2_R0348_Hotspot_vs_UniformParity | A_main_QC_12x24_Z32 | HotspotOnlyParity | EbN0=1.5
+[done] Exp2_R0348_Hotspot_vs_UniformParity | A_main_QC_12x24_Z32 | HotspotOnlyParity | EbN0=1.75
+[done] Exp2_R0348_Hotspot_vs_UniformParity | A_main_QC_12x24_Z32 | HotspotOnlyParity | EbN0=2
+[done] Exp2_R0348_Hotspot_vs_UniformParity | A_main_QC_12x24_Z32 | HotspotOnlyParity | EbN0=2.25
+[done] Exp2_R04_Hotspot_vs_UniformParity | A_main_QC_12x24_Z32 | UniformParity | EbN0=1.5
+[done] Exp2_R04_Hotspot_vs_UniformParity | A_main_QC_12x24_Z32 | UniformParity | EbN0=1.75
+[done] Exp2_R04_Hotspot_vs_UniformParity | A_main_QC_12x24_Z32 | UniformParity | EbN0=2
+[done] Exp2_R04_Hotspot_vs_UniformParity | A_main_QC_12x24_Z32 | UniformParity | EbN0=2.25
+[done] Exp2_R04_Hotspot_vs_UniformParity | A_main_QC_12x24_Z32 | HotspotOnlyParity | EbN0=1.5
+[done] Exp2_R04_Hotspot_vs_UniformParity | A_main_QC_12x24_Z32 | HotspotOnlyParity | EbN0=1.75
+[done] Exp2_R04_Hotspot_vs_UniformParity | A_main_QC_12x24_Z32 | HotspotOnlyParity | EbN0=2
+[done] Exp2_R04_Hotspot_vs_UniformParity | A_main_QC_12x24_Z32 | HotspotOnlyParity | EbN0=2.25
+saved exp2_results.csv rows=16

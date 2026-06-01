@@ -1,0 +1,12 @@
+Algorithm repair compile check
+
+Environment: Linux g++, C++17
+
+Checked:
+- All 9 experiment entrypoints compile with: g++ -std=c++17 -O0 <main.cpp>
+- Representative O2 compile checks passed for all experiment entrypoints individually with: g++ -std=c++17 -O2 <main.cpp>
+- Short smoke CSVs were generated for experiments 1, 2, 3, 4, 5, 6 and 9.
+- Static construction diagnostics were generated in validation_smoke/construction_diagnostics_fixed.csv.
+
+Note:
+The packaged historical all_results_frames_* directories from the original zip were removed from this fixed-source deliverable to avoid mixing old results with the repaired algorithm.

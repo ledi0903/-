@@ -1,0 +1,9 @@
+matrix,rate,adaptive,reason,weak_concentration,block_imbalance,coupling_risk,hot_cov,hot_top10,hot_dup,hot_maxuse,hot_pairmax,hot_q,ext_cov,ext_top10,ext_dup,ext_maxuse,ext_pairmax,ext_q
+A_main_QC_12x24_Z32,0.348,HotspotOnlyParity,hot_safe_static_gate,0.148828,0.624403,0.203125,0.822917,0.136119,0,6,1,0.721217,1,0.113433,0,5,1,0.828421
+A_main_QC_12x24_Z32,0.4,HotspotOnlyParity,hot_safe_static_gate,0.148828,0.624403,0.203125,0.822917,0.138542,0,4,1,0.719236,1,0.11875,0,3,1,0.824536
+B_balanced_QC_12x24_Z32,0.348,ExtParityV2,weakness_not_concentrated_enough,0.160509,0.333532,0,0.822917,0.151642,0,7,1,0.694787,1,0.113433,0,5,1,0.825675
+B_balanced_QC_12x24_Z32,0.4,ExtParityV2,weakness_not_concentrated_enough,0.160509,0.333532,0,0.822917,0.158333,0,4,1,0.69145,1,0.11875,0,3,1,0.819713
+C_long_QC_14x28_Z32,0.348,ExtParityV2,ext_quality_or_rate_gate,0.165647,0.507705,0.0267857,0.810268,0.157545,0,7,2,0.700646,1,0.112532,0,5,1,0.82593
+C_long_QC_14x28_Z32,0.4,ExtParityV2,ext_quality_or_rate_gate,0.165647,0.507705,0.0267857,0.810268,0.166964,0,5,2,0.696266,1,0.117857,0,3,1,0.821885
+D_short_hotspot_QC_8x16_Z32,0.348,HotspotOnlyParity,hot_safe_static_gate,0.163092,0.515695,0,0.875,0.133929,0,6,1,0.742732,1,0.111607,0,5,1,0.823253
+D_short_hotspot_QC_8x16_Z32,0.4,HotspotOnlyParity,hot_safe_static_gate,0.163092,0.515695,0,0.875,0.121875,0,4,1,0.747814,1,0.117188,0,3,1,0.821041
